@@ -2,6 +2,8 @@ from typing import List, Dict, Tuple, Optional, Set
 from collections import defaultdict
 import bisect
 import heapq
+import random
+import time as time_module
 
 from models.instance_data import InstanceData
 from models.solution import Solution
@@ -16,12 +18,18 @@ class BeamSearchScheduler:
                  beam_width: int = 50,
                  lookahead_limit: int = 4,
                  density_percentile: int = 25,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 noise_strength: float = 0.08,
+                 n_runs: int = 3,
+                 time_limit: int = 300):
         self.instance_data = instance_data
         self.beam_width = beam_width
         self.lookahead_limit = lookahead_limit
         self.density_percentile = density_percentile
         self.verbose = verbose
+        self.noise_strength = noise_strength  # 0 = deterministic, 0.30 = good diversity
+        self.n_runs = n_runs  # run N times with noise, keep the best
+        self.time_limit = time_limit  # max seconds (0 = no limit)
         self.min_d = instance_data.min_duration
         
         self._preprocess()
@@ -125,6 +133,23 @@ class BeamSearchScheduler:
             
         if self.verbose:
             print(f"Average score density (top {self.density_percentile}%): {self.avg_score_per_min:.4f} pts/min")
+        
+        # For large instances, prefilter to top channels by total program score
+        if self.n_channels > 200:
+            ch_scores = []
+            for ch_idx, channel in enumerate(self.instance_data.channels):
+                total = sum(p.score for p in channel.programs)
+                ch_scores.append((total, ch_idx))
+            ch_scores.sort(reverse=True)
+            self.active_channels = [idx for _, idx in ch_scores[:200]]
+            if self.verbose:
+                print(f"Using top 200/{self.n_channels} channels by score")
+        else:
+            self.active_channels = list(range(self.n_channels))
+        
+        # Noise scale: used as random tiebreaker magnitude
+        # (kept for reference but _noise_mult is used instead)
+        self.noise_scale = self.noise_strength
     
     def _get_prog(self, ch_idx: int, time: int) -> Optional[Program]:
         """Get program at time on channel (binary search)."""
@@ -203,6 +228,19 @@ class BeamSearchScheduler:
         
         return score
     
+    def _rand_tiebreak(self) -> float:
+        """Small random value to break ties in sorting. Guarantees different orderings per run."""
+        if self.noise_strength <= 0:
+            return 0.0
+        return random.uniform(-self.noise_scale, self.noise_scale)
+    
+    def _noise_mult(self, value: float) -> float:
+        """Multiply value by a random factor (1 ± noise_strength). 
+        With noise_strength=0.30, values get perturbed by ±30%."""
+        if self.noise_strength <= 0:
+            return value
+        return value * (1.0 + random.uniform(-self.noise_strength, self.noise_strength))
+    
     def _get_candidates(self, time: int, prev_ch_id: Optional[int],
                         prev_genre: str, genre_streak: int,
                         used_progs: Set[str]) -> List[Tuple[int, int, int, Program, int, int]]:
@@ -217,7 +255,7 @@ class BeamSearchScheduler:
         candidates = []
         closing = self.instance_data.closing_time
         
-        for ch_idx in range(self.n_channels):
+        for ch_idx in self.active_channels:
             channel = self.instance_data.channels[ch_idx]
             ch_id = channel.channel_id
             
@@ -241,28 +279,20 @@ class BeamSearchScheduler:
             # Try different end times
             end_options = set()
             
-            # Option 1: Natural program end
+            # Option 1: Natural program end (always include)
             nat_end = min(prog.end, closing)
             if nat_end - seg_start >= self.min_d:
                 end_options.add(nat_end)
             
-            # Option 2: Early stops at program boundaries
-            # Optimize: Use bisect to find relevant times
-            start_idx = bisect.bisect_right(self.times, seg_start + self.min_d)
-            end_idx = bisect.bisect_left(self.times, nat_end)
-            
-            for i in range(start_idx, end_idx + 1):
-                if i >= len(self.times):
-                    break
-                t = self.times[i]
-                if t > nat_end:
-                    break
-                end_options.add(t)
-            
-            # Option 3: End at exact min_duration
+            # Option 2: End at exact min_duration (always include)
             min_end = seg_start + self.min_d
             if min_end <= nat_end:
                 end_options.add(min_end)
+            
+            # Option 3: A midpoint for medium-length viewing
+            mid_end = (min_end + nat_end) // 2
+            if min_end < mid_end < nat_end:
+                end_options.add(mid_end)
             
             for seg_end in sorted(end_options):
                 if seg_end > closing:
@@ -276,57 +306,54 @@ class BeamSearchScheduler:
                 if score > -999999:
                     candidates.append((score, ch_idx, ch_id, prog, seg_start, seg_end))
         
-        # Also try looking ahead for future programs that might offer better value
-        # This helps when current time has no good options but a program starts soon
-        # Improved lookahead: Check actual future time points instead of fixed offsets
-        start_idx = bisect.bisect_right(self.times, time)
-        lookahead_count = 0
-        
-        for i in range(start_idx, len(self.times)):
-            future_time = self.times[i]
-            if future_time >= closing:
-                break
-            # Don't look too far ahead (performance)
-            if future_time > time + self.min_d * self.lookahead_limit:
-                break
-                
-            lookahead_count += 1
-            if lookahead_count > self.lookahead_limit: # Limit lookahead checks
-                break
+        # Lookahead: check future program starts (skip for huge instances - too slow)
+        if self.n_channels <= 500:
+            start_idx = bisect.bisect_right(self.times, time)
+            lookahead_count = 0
             
-            # Optimized: Use starts_at index instead of iterating all channels
-            for prog, ch_idx in self.starts_at.get(future_time, []):
-                channel = self.instance_data.channels[ch_idx]
-                ch_id = channel.channel_id
+            for i in range(start_idx, len(self.times)):
+                future_time = self.times[i]
+                if future_time >= closing:
+                    break
+                # Don't look too far ahead (performance)
+                if future_time > time + self.min_d * self.lookahead_limit:
+                    break
+                    
+                lookahead_count += 1
+                if lookahead_count > self.lookahead_limit: # Limit lookahead checks
+                    break
                 
-                if prog.unique_id in used_progs:
-                    continue
-                
-                # Only consider if this is a program START (not late join)
-                # (Implicitly true because we used starts_at)
-                
-                new_streak = 1 if prog.genre != prev_genre else genre_streak + 1
-                if new_streak > self.instance_data.max_consecutive_genre:
-                    continue
-                
-                nat_end = min(prog.end, closing)
-                if nat_end - future_time < self.min_d:
-                    continue
-                
-                if not self._channel_allowed(ch_idx, future_time, nat_end):
-                    continue
-                
-                # Use future_time as start (with a small penalty for waiting)
-                score = self._calc_score(prog, ch_idx, future_time, nat_end, prev_ch_id)
-                if score > -999999:
-                    candidates.append((score, ch_idx, ch_id, prog, future_time, nat_end))
+                # Optimized: Use starts_at index instead of iterating all channels
+                for prog, ch_idx in self.starts_at.get(future_time, []):
+                    channel = self.instance_data.channels[ch_idx]
+                    ch_id = channel.channel_id
+                    
+                    if prog.unique_id in used_progs:
+                        continue
+                    
+                    new_streak = 1 if prog.genre != prev_genre else genre_streak + 1
+                    if new_streak > self.instance_data.max_consecutive_genre:
+                        continue
+                    
+                    nat_end = min(prog.end, closing)
+                    if nat_end - future_time < self.min_d:
+                        continue
+                    
+                    if not self._channel_allowed(ch_idx, future_time, nat_end):
+                        continue
+                    
+                    score = self._calc_score(prog, ch_idx, future_time, nat_end, prev_ch_id)
+                    if score > -999999:
+                        candidates.append((score, ch_idx, ch_id, prog, future_time, nat_end))
         
         return candidates
     
-    def _beam_search_core(self) -> Solution:
+    def _beam_search_core(self, deadline: float = 0) -> Solution:
         """
         Core beam search algorithm.
-        Deterministic version.
+        Noise is injected into ranking (not into actual scores) so each run
+        explores different paths while still preferring high-score candidates.
+        If deadline > 0, stops early and returns best found so far.
         """
         opening = self.instance_data.opening_time
         closing = self.instance_data.closing_time
@@ -342,6 +369,15 @@ class BeamSearchScheduler:
         
         while beam and iterations < max_iterations:
             iterations += 1
+            
+            # Check time limit
+            if deadline > 0 and time_module.time() >= deadline:
+                # Collect best from current beam before stopping
+                for state in beam:
+                    if state[0] > best_solution[0]:
+                        best_solution = (state[0], list(state[5]))
+                break
+            
             next_beam = []
             
             for state in beam:
@@ -366,14 +402,24 @@ class BeamSearchScheduler:
                             best_solution = (score, list(sched_tuple))
                     continue
                 
-                # Sort by score density heuristic: score + potential of remaining time
-                # This prefers candidates that give high score for less time usage
+                # Sort deterministically by heuristic (quality-first for candidate selection)
                 candidates.sort(key=lambda x: x[0] + (closing - x[5]) * self.avg_score_per_min, reverse=True)
                 
-                # Take top candidates
-                take_n = max(3, self.beam_width // len(beam) if len(beam) > 0 else self.beam_width)
+                # For diversity: randomly swap one pair in the top-5 candidates
+                if self.noise_strength > 0 and len(candidates) >= 2:
+                    top = min(5, len(candidates))
+                    i1 = random.randint(0, top - 1)
+                    i2 = random.randint(0, top - 1)
+                    if i1 != i2:
+                        candidates[i1], candidates[i2] = candidates[i2], candidates[i1]
                 
-                for i, (seg_score, ch_idx, ch_id, prog, seg_start, seg_end) in enumerate(candidates[:take_n]):
+                # Take top candidates (fewer for huge instances)
+                if self.n_channels > 500:
+                    take_n = max(2, self.beam_width // max(1, len(beam)))
+                else:
+                    take_n = max(3, self.beam_width // len(beam) if len(beam) > 0 else self.beam_width)
+                
+                for seg_score, ch_idx, ch_id, prog, seg_start, seg_end in candidates[:take_n]:
                     new_sched = sched_tuple + ((prog.unique_id, ch_id, seg_start, seg_end, seg_score),)
                     new_used = used | {prog.unique_id}
                     new_streak = 1 if prog.genre != prev_genre else g_streak + 1
@@ -390,17 +436,19 @@ class BeamSearchScheduler:
             if not next_beam:
                 break
             
-            # Keep best states
-            # Sort by heuristic: accumulated_score + potential_future_score
-            next_beam.sort(key=lambda x: x[0] + (closing - x[1]) * self.avg_score_per_min, reverse=True)
+            # Sort by heuristic with multiplicative noise for beam pruning
+            next_beam.sort(key=lambda x: self._noise_mult(
+                x[0] + (closing - x[1]) * self.avg_score_per_min
+            ), reverse=True)
             
-            # Deduplicate by (time, prev_ch, genre_streak)
-            seen = set()
+            # Deduplicate by (time, prev_ch, genre_streak) — allow 2 per key for diversity
+            seen = {}
             unique_beam = []
             for state in next_beam:
                 key = (state[1], state[2], state[4])  # time, prev_ch, g_streak
-                if key not in seen:
-                    seen.add(key)
+                count = seen.get(key, 0)
+                if count < 2:
+                    seen[key] = count + 1
                     unique_beam.append(state)
                 if len(unique_beam) >= self.beam_width:
                     break
@@ -425,19 +473,25 @@ class BeamSearchScheduler:
         
         return Solution(scheduled, best_solution[0])
     
-    def _local_search(self, sol: Solution, max_iter: int = 50) -> Solution:
-        """Improve solution with local search."""
+    def _local_search(self, sol: Solution, max_iter: int = 50, deadline: float = 0) -> Solution:
+        """Improve solution with local search. Uses noise for diverse re-fill."""
         if not sol.scheduled_programs:
             return sol
         
         best = sol.scheduled_programs[:]
         best_score = sol.total_score
         
-        for _ in range(max_iter):
+        for iter_i in range(max_iter):
+            # Check time limit
+            if deadline > 0 and time_module.time() >= deadline:
+                break
+            
             improved = False
             
-            # Try removing each program and re-fill greedily
-            for i in range(len(best)):
+            # Randomize removal order for diversity
+            indices = list(range(len(best)))
+            random.shuffle(indices)
+            for i in indices:
                 prefix = best[:i]
                 
                 # Get state from prefix
@@ -472,9 +526,15 @@ class BeamSearchScheduler:
                             break
                         continue
                     
-                    # Optimized: Use score density heuristic
+                    # Sort deterministically, then randomly pick from top-3 for diversity
                     candidates.sort(key=lambda x: x[0] + (self.instance_data.closing_time - x[5]) * self.avg_score_per_min, reverse=True)
-                    seg_score, ch_idx, ch_id, prog, seg_start, seg_end = candidates[0]
+                    pick = 0
+                    if self.noise_strength > 0 and len(candidates) >= 2:
+                        # Scale pick probability by instance size: more for small, less for large
+                        pick_prob = 0.25 if self.n_channels <= 20 else 0.10 if self.n_channels <= 100 else 0.05
+                        if random.random() < pick_prob:
+                            pick = random.randint(1, min(2, len(candidates) - 1))
+                    seg_score, ch_idx, ch_id, prog, seg_start, seg_end = candidates[pick]
                     
                     new_sched.append(Schedule(
                         program_id=prog.program_id,
@@ -508,33 +568,66 @@ class BeamSearchScheduler:
         return Solution(best, best_score)
     
     def generate_solution(self) -> Solution:
-        """Generate the maximum score solution."""
-        # Adaptive parameters for large instances
-        if self.n_channels > 50:
-            # Optimized: Set to 500 for good balance of speed and score
-            if self.beam_width < 500:
-                if self.verbose:
-                    print(f"Large instance detected ({self.n_channels} channels). Setting beam width to 500 for speed/quality balance.")
-                self.beam_width = 500
-        if self.verbose:
-            print(f"\n{'='*70}")
-            print("MAX SCORE SCHEDULER")
-            print(f"Channels: {self.n_channels}, Beam: {self.beam_width}")
-            print(f"{'='*70}\n")
+        """Generate the best solution. Runs N noisy passes, keeps the best.
+        Each call produces different results due to randomness.
+        Respects time_limit — stops and returns best-so-far if exceeded."""
+        # Adaptive beam width: smaller beams for more channels (random tiebreaker compensates)
+        if self.n_channels > 1000:
+            target = 20
+        elif self.n_channels > 500:
+            target = 30
+        elif self.n_channels > 200:
+            target = 50
+        elif self.n_channels > 50:
+            target = max(self.beam_width, 100)
+        else:
+            target = self.beam_width
         
-        # Strategy: Beam search (deterministic)
-        if self.verbose:
-            print("Running Beam Search...")
-        sol = self._beam_search_core()
+        if self.beam_width != target:
+            if self.verbose:
+                print(f"Adjusted beam width {self.beam_width} -> {target} for {self.n_channels} channels")
+            self.beam_width = target
         
-        # Always run local search, but with fewer iterations for large instances
+        # Compute deadline
+        wall_start = time_module.time()
+        deadline = wall_start + self.time_limit if self.time_limit > 0 else 0
+        
+        if self.verbose:
+            limit_str = f"{self.time_limit}s" if self.time_limit > 0 else "none"
+            print(f"\n{'='*60}")
+            print(f"BEAM SEARCH  |  Ch: {self.n_channels}  Beam: {self.beam_width}  "
+                  f"Noise: {self.noise_strength}  Runs: {self.n_runs}  Limit: {limit_str}")
+            print(f"{'='*60}")
+        
         iter_limit = 50 if self.n_channels <= 50 else 20
-        sol = self._local_search(sol, max_iter=iter_limit)
+        best_sol = None
         
+        for run in range(self.n_runs):
+            # Check time limit before starting a new run
+            if deadline > 0 and time_module.time() >= deadline:
+                if self.verbose:
+                    elapsed = time_module.time() - wall_start
+                    print(f"  Time limit reached ({elapsed:.1f}s). Stopping.")
+                break
+            
+            sol = self._beam_search_core(deadline=deadline)
+            sol = self._local_search(sol, max_iter=iter_limit, deadline=deadline)
+            
+            if best_sol is None or sol.total_score > best_sol.total_score:
+                best_sol = sol
+            
+            if self.verbose:
+                marker = " *" if sol.total_score == best_sol.total_score else ""
+                print(f"  Run {run+1}/{self.n_runs}: {sol.total_score}{marker}")
+        
+        # Safety: if no solution at all (shouldn't happen)
+        if best_sol is None:
+            best_sol = Solution([], 0)
+        
+        elapsed = time_module.time() - wall_start
         if self.verbose:
-            print(f"  Score: {sol.total_score}")
-            print(f"\n{'='*70}")
-            print(f"BEST: Score={sol.total_score}, Programs={len(sol.scheduled_programs)}")
-            print(f"{'='*70}\n")
+            print(f"Best: {best_sol.total_score}  Programs: {len(best_sol.scheduled_programs)}  "
+                  f"Time: {elapsed:.1f}s")
+            print(f"{'='*60}\n")
         
-        return sol
+        return best_sol
